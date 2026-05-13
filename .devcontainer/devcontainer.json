@@ -1,0 +1,22 @@
+{
+  "name": "redis-linux-dev",
+  "build": {
+    "dockerfile": "../Dockerfile",
+    "context": ".."
+  },
+  "workspaceFolder": "/workspace",
+  "customizations": {
+    "vscode": {
+      "settings": {
+        "cmake.useCMakePresets": "always",
+        "cmake.configureOnOpen": true,
+        "cmake.defaultConfigurePreset": "dev",
+        "cmake.defaultBuildPreset": "dev"
+      },
+      "extensions": [
+        "ms-vscode.cpptools",
+        "ms-vscode.cmake-tools"
+      ]
+    }
+  }
+}
