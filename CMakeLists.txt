@@ -21,7 +21,10 @@ target_include_directories(redis_core
 
 add_executable(redis_client src/core/client.cpp)
 
-add_executable(redis_server src/server/server.cpp)
+add_executable(redis_server
+  src/server/server.cpp
+  src/server/ring_buffer.cpp
+)
 target_link_libraries(redis_client PRIVATE redis_core)
 target_link_libraries(redis_server PRIVATE redis_core)
 
