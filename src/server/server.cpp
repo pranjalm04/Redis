@@ -7,6 +7,7 @@
 #include <sys/poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <algorithm>
 #include <vector>
 #include <cstdio>
 #include <cstring>
@@ -14,7 +15,10 @@
 #include <cstdint>
 #include <assert.h>
 
+#include "server/ring_buffer.h"
+
 const size_t k_max_msg = 32 << 20;
+static const size_t k_conn_buf_cap = 256 * 1024;
 
 void die(const char *msg) {
     int err = errno;
@@ -27,8 +31,8 @@ struct Conn{
     bool want_read;
     bool want_write;
     bool want_close;
-    std::vector<uint8_t> incoming;
-    std::vector<uint8_t> outgoing;
+    RingBuffer incoming{k_conn_buf_cap};
+    RingBuffer outgoing{k_conn_buf_cap};
 };
 
 static void msg_errno(const char *msg){
@@ -72,20 +76,15 @@ Conn* handle_accept(int fd)
     return conn;
 }
 
-static void buf_consume(std::vector<uint8_t>& buf, size_t len)
-{
-    buf.erase(buf.begin(), buf.begin() + len);
-}
-
 bool try_one_request(Conn* conn)
 {
-    if(conn->incoming.size() < 4)
+    if(conn->incoming.used() < 4)
     {
         return false;
     }
 
     uint32_t len_be = 0;
-    memcpy(&len_be, conn->incoming.data(), 4);
+    conn->incoming.peek(0, reinterpret_cast<uint8_t*>(&len_be), sizeof(len_be));
     uint32_t len = ntohl(len_be);
     if(len > k_max_msg)
     {
@@ -93,30 +92,54 @@ bool try_one_request(Conn* conn)
         conn->want_close = true;
         return false;
     }
-    if(conn->incoming.size() < 4 + len)
+    if(conn->incoming.used() < 4 + len)
     {
         return false;
     }
-    const uint8_t* request = &conn->incoming[4];
+
+    const size_t preview_len = len < 100 ? len : 100;
+    uint8_t preview[100] = {};
+    conn->incoming.peek(4, preview, preview_len);
     printf("client says: len:%d data:%.*s\n",
-        len, len < 100 ? len : 100, request);
+        len, (int)preview_len, preview);
 
     uint32_t out_len_be = htonl(len);
-    conn->outgoing.insert(
-        conn->outgoing.end(),
-        reinterpret_cast<const uint8_t*>(&out_len_be),
-        reinterpret_cast<const uint8_t*>(&out_len_be) + sizeof(out_len_be));
-    conn->outgoing.insert(conn->outgoing.end(),request, request + len);
-    buf_consume(conn->incoming, 4 + len);
+    const uint8_t* out_hdr =
+        reinterpret_cast<const uint8_t*>(&out_len_be);
+    if(conn->outgoing.push(out_hdr, sizeof(out_len_be)) < sizeof(out_len_be))
+    {
+        msg_errno("outgoing buffer full");
+        conn->want_close = true;
+        return false;
+    }
+
+    uint8_t chunk[4096];
+    size_t offset = 4;
+    size_t remaining = len;
+    while(remaining > 0)
+    {
+        const size_t n = std::min(remaining, sizeof(chunk));
+        conn->incoming.peek(offset, chunk, n);
+        if(conn->outgoing.push(chunk, n) < n)
+        {
+            msg_errno("outgoing buffer full");
+            conn->want_close = true;
+            return false;
+        }
+        offset += n;
+        remaining -= n;
+    }
+
+    conn->incoming.consume(4 + len);
     conn->want_write = true;
     return true;
-
-    
 }
 static void handle_write(Conn *conn)
 {
-    assert(conn->outgoing.size()>0);
-    ssize_t rv = write(conn->fd, conn->outgoing.data(), conn->outgoing.size());
+    assert(!conn->outgoing.empty());
+    const uint8_t* data = conn->outgoing.read_ptr();
+    const size_t n = conn->outgoing.readable_contiguous();
+    ssize_t rv = write(conn->fd, data, n);
     if(rv<0 && errno == EAGAIN)
     {
         return;
@@ -127,7 +150,7 @@ static void handle_write(Conn *conn)
         conn->want_close = true;
         return;
     }
-    buf_consume(conn->outgoing, (size_t)rv);
+    conn->outgoing.consume((size_t)rv);
 
     if(conn->outgoing.empty())
     {
@@ -146,7 +169,9 @@ static void handle_read(Conn *conn)
     }
     if(rv < 0)
     {
-        die("read");
+        msg_errno("read() error");
+        conn->want_close = true;
+        return;
     }
     if(rv == 0)
     {
@@ -161,16 +186,35 @@ static void handle_read(Conn *conn)
 
         conn->want_close = true;
     }
-    conn->incoming.insert(conn->incoming.end(), buf, buf + (size_t)rv);
+    const size_t pushed = conn->incoming.push(buf, (size_t)rv);
+    if(pushed < (size_t)rv)
+    {
+        msg_errno("incoming buffer full");
+        conn->want_close = true;
+        return;
+    }
 
     while(try_one_request(conn)){}
 
-    if(conn->outgoing.size())
+    if(!conn->outgoing.empty())
     {
         conn->want_write = true;
         conn->want_read = false;
         handle_write(conn);
     }
+}
+void cleanup_conn(std::vector<Conn *> &fd2conn)
+{
+    for(auto& fd_conn : fd2conn)
+    {
+        if(fd_conn)
+        {
+            close(fd_conn->fd);
+            delete fd_conn;
+            fd_conn = nullptr;
+        }
+    }
+    fd2conn.clear();
 }
 int main() {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -181,6 +225,7 @@ int main() {
     int val = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val));
 
+    bool cleanup = false;
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
     addr.sin_port = ntohs(1234);
@@ -232,7 +277,9 @@ int main() {
         }
         if(rv < 0)
         {
-            die("poll");
+            msg_errno("poll() error, exiting the event loop");
+            cleanup_conn(fd2conn);
+            break;
         }
 
         if(poll_args[0].revents)
