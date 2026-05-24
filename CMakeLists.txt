@@ -23,7 +23,12 @@ add_executable(redis_client src/core/client.cpp)
 
 add_executable(redis_server
   src/server/server.cpp
+  src/server/server_context.cpp
   src/server/ring_buffer.cpp
+  src/storage/inmemory_cache.cpp
+  src/domain/command_result.cpp
+  src/domain/command_dispatcher.cpp
+  src/protocol/resp_parser.cpp
 )
 target_link_libraries(redis_client PRIVATE redis_core)
 target_link_libraries(redis_server PRIVATE redis_core)
